@@ -163,6 +163,76 @@ function listLogs() {
 
 // ──────────────────── 快层：不解日志，毫秒级 ────────────────────
 
+// ──────────────────────── 桌面端崩溃日志 ────────────────────────
+// ★ 为什么加这一项：
+//   回声原来只体检「记忆六层」（压缩/门牌/索引/自我层/心跳/账本/热记忆…），
+//   **进程级事件它一概看不见**。2026-10-25 实测：一次批量 Stop-Process 把 DSH 的
+//   renderer 一起杀了，界面崩掉，而回声这边十几项全是绿的 —— 因为它根本不看那个面。
+//   证据其实一直躺在磁盘上：%APPDATA%\@deepseek-ai\dsh-desktop\logs\crash-*.log
+//   （DSH 桌面端自己写的，host / renderer 两类，带 time/source/error 三段）。
+// ★ 判据：崩溃是「外部事件」，不等于「记忆架构坏了」——
+//   所以这一项最多给 warn，绝不给 error，别让一次误杀把整套体检染红。
+const CRASH_DIR = path.join(
+  process.env.APPDATA || path.join(process.env.USERPROFILE || "", "AppData", "Roaming"),
+  "@deepseek-ai", "dsh-desktop", "logs",
+);
+const CRASH_WINDOW_H = 24;   // 看最近 24 小时
+const CRASH_RECENT_H = 1;    // 1 小时内 = 刚刚崩过，要显眼
+
+/** 从一个 crash-*.log 里抽出 time/source/错误首行。读不出就给 null，不抛。 */
+function parseCrashLog(file) {
+  const txt = readText(file);
+  if (txt === null) return null;
+  const source = (txt.match(/^source:\s*(\S+)/m) || [])[1] || "?";
+  const time = (txt.match(/^time:\s*(\S+)/m) || [])[1] || null;
+  const errBlock = txt.split(/^--- error ---\s*$/m)[1] || "";
+  const firstErr = errBlock.split("\n").map((s) => s.trim()).find((s) => s.length > 0) || "";
+  return { file: path.basename(file), source, time, firstError: firstErr.slice(0, 160) };
+}
+
+function checkCrashes() {
+  const label = "崩溃日志（host / renderer）";
+  let names = [];
+  try { names = fs.readdirSync(CRASH_DIR).filter((n) => /^crash-.*\.log$/.test(n)) } catch {
+    // 目录不在 = 不是桌面端环境（headless / web profile），不是「坏了」
+    return { id: "crashes", label, status: "info", detail: "找不到桌面端日志目录 —— 非桌面端运行时这项不适用", evidence: { dir: CRASH_DIR } };
+  }
+  const now = Date.now();
+  const recent = [];
+  for (const n of names) {
+    const full = path.join(CRASH_DIR, n);
+    const st = statSafe(full);
+    if (!st) continue;
+    const ageH = (now - st.mtimeMs) / 3600000;
+    if (ageH > CRASH_WINDOW_H) continue;
+    const parsed = parseCrashLog(full) || { file: n, source: "?", time: null, firstError: "" };
+    parsed.ageHours = round1(ageH);
+    recent.push(parsed);
+  }
+  recent.sort((a, b) => a.ageHours - b.ageHours);
+  const hot = recent.filter((c) => c.ageHours <= CRASH_RECENT_H);
+  const hostCount = recent.filter((c) => c.source === "host").length;
+  const rendererCount = recent.filter((c) => c.source === "renderer").length;
+
+  // 0 次 → ok；只在 24h 窗口里有 → info（历史，提醒你它发生过）；1 小时内 → warn。
+  const status = hot.length > 0 ? "warn" : recent.length > 0 ? "info" : "ok";
+  const head = recent[0];
+  let detail;
+  if (recent.length === 0) {
+    detail = "最近 " + CRASH_WINDOW_H + " 小时没有崩溃记录（扫了 " + names.length + " 份历史日志）";
+  } else {
+    detail = "最近 " + CRASH_WINDOW_H + " 小时 " + recent.length + " 次崩溃（host " + hostCount + " / renderer " + rendererCount + "）";
+    if (head) detail += "；最近一次 " + head.ageHours + "h 前 [" + head.source + "]：" + (head.firstError || "（日志里没有 error 段）");
+    if (hot.length > 0) detail += " ★ 1 小时内有崩溃，先确认不是刚被谁杀过进程";
+  }
+  return {
+    id: "crashes", label, status,
+    detail,
+    evidence: { dir: CRASH_DIR, scanned: names.length, recent: recent.slice(0, 5) },
+  };
+}
+
+
 /** ★ 配置本身有没有到位 —— 这一项必须排在最前面。
  *  因为「装完了但还没配」是每个新人的第一步，那时候其余各项全是「读不到」，
  *  光看那些看不出根因。这一项直接说：先去跑 scaffold。 */
@@ -641,6 +711,7 @@ export function runDoctor(opts = {}) {
     checkVersionDrift(),
     checkIdentity(),
     checkHuanqi(logs, deep),
+    checkCrashes(),
   ];
   const order = { error: 0, warn: 1, ok: 2, info: 3 };
   // 总判只看有结论的项 —— info（待深检）不拉低总判，否则快检永远是"未完成"
